@@ -5,3 +5,4 @@ New Microsoft Word Document.docx
 # cpp output files
 *.o
 *vscode*/
+raw/
