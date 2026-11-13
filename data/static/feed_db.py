@@ -1,0 +1,498 @@
+"""Prepare project CSVs and populate the PostgreSQL input schemas.
+
+This is the preparation stage of the project pipeline. It:
+
+1. Cleans the raw file and removes exact duplicate rows.
+2. Splits the cleaned rows using the required MD5 sales-mode rule.
+3. Writes the project CSV files:
+       online_sales_stream.csv
+       customer_master_data.csv
+       product_master_data.csv
+4. Loads the two input schemas and the two staging master-data tables.
+
+Run the schema SQL before running this file. Database credentials are accepted
+as command-line arguments or requested interactively; passwords are never
+written into this source file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import shutil
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from getpass import getpass
+from pathlib import Path
+from typing import Iterable, Sequence
+
+try:  # psycopg 3 is preferred.
+    import psycopg  # type: ignore
+except ImportError:  # pragma: no cover - depends on the user's environment.
+    psycopg = None
+
+try:  # psycopg2 is supported as a fallback.
+    import psycopg2  # type: ignore
+except ImportError:  # pragma: no cover - depends on the user's environment.
+    psycopg2 = None
+
+from clean_data import clean_file
+from data_split import split_file
+
+
+DATE_FORMAT = "%d/%m/%Y %H:%M"
+INSERT_BATCH_SIZE = 2_000
+
+GENDERS = ("Male", "Female")
+AGE_GROUPS = ("0-17", "18-25", "26-35", "36-45", "46-50", "51-55", "55+")
+OCCUPATIONS = (
+    "Student",
+    "Engineer",
+    "Teacher",
+    "Executive",
+    "Clerk",
+    "Healthcare",
+    "Retail",
+    "Homemaker",
+    "Artist",
+    "Other",
+)
+CITY_CATEGORIES = ("A", "B", "C")
+STAY_VALUES = ("0", "1", "2", "3", "4+")
+MARITAL_STATUSES = ("Single", "Married")
+PRODUCT_CATEGORIES = (
+    "Home Decor",
+    "Kitchen",
+    "Stationery",
+    "Toys",
+    "Seasonal Gifts",
+    "Bags",
+    "Jewelry",
+    "Garden",
+    "Party",
+    "Other",
+)
+SUPPLIERS = (
+    ("SUP01", "Northwind Supplies"),
+    ("SUP02", "Atlantic Gifts Ltd"),
+    ("SUP03", "Midlands Wholesale"),
+    ("SUP04", "Celtic Craft Co"),
+    ("SUP05", "EuroPack Partners"),
+)
+
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    host: str
+    port: int
+    database: str
+    user: str
+    password: str
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def stable(text: str, modulus: int) -> int:
+    """Implement the project's stable MD5(text, n) rule."""
+
+    digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+    return int(digest, 16) % modulus
+
+
+def parse_event_time(value: str) -> datetime:
+    return datetime.strptime(value.strip(), DATE_FORMAT)
+
+
+def integer_customer_id(value: str) -> int:
+    # Customer IDs in the UCI file are whole numbers. This also gives a clear
+    # error if a malformed value has somehow reached this stage.
+    parsed = Decimal(value.strip())
+    if parsed != parsed.to_integral_value():
+        raise ValueError(f"CustomerID is not an integer: {value!r}")
+    return int(parsed)
+
+
+def prepare_master_rows(
+    processed_path: Path,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Create deterministic customer and product master rows.
+
+    The first country seen for a customer is retained. Product descriptions
+    use the longest non-empty description, as required by the brief.
+    """
+
+    customer_countries: dict[int, str] = {}
+    product_names: dict[str, str] = {}
+    product_ids: set[str] = set()
+    customer_ids: set[int] = set()
+
+    with processed_path.open("r", encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        if reader.fieldnames is None:
+            raise ValueError("The processed CSV has no header row.")
+
+        required = {
+            "InvoiceNo",
+            "StockCode",
+            "Description",
+            "InvoiceDate",
+            "CustomerID",
+            "Country",
+        }
+        missing = required.difference(reader.fieldnames)
+        if missing:
+            raise ValueError(
+                "The processed CSV is missing required columns: "
+                + ", ".join(sorted(missing))
+            )
+
+        for row_number, row in enumerate(reader, start=2):
+            customer_id = integer_customer_id((row.get("CustomerID") or "").strip())
+            product_id = (row.get("StockCode") or "").strip()
+            country = (row.get("Country") or "").strip()
+            description = (row.get("Description") or "").strip()
+
+            customer_ids.add(customer_id)
+            customer_countries.setdefault(customer_id, country)
+            product_ids.add(product_id)
+
+            old_name = product_names.get(product_id, "")
+            if len(description) > len(old_name):
+                product_names[product_id] = description
+
+    customer_rows: list[dict[str, str]] = []
+    for customer_id in sorted(customer_ids):
+        customer_text = str(customer_id)
+        country = customer_countries[customer_id]
+        customer_rows.append(
+            {
+                "customer_id": customer_text,
+                "gender": GENDERS[stable(customer_text, 2)],
+                "age_group": AGE_GROUPS[stable(customer_text + "age", 7)],
+                "occupation": OCCUPATIONS[stable(customer_text + "occ", 10)],
+                "city_category": CITY_CATEGORIES[
+                    stable(customer_text + country, 3)
+                ],
+                "stay_in_current_city_years": STAY_VALUES[
+                    stable(customer_text + "stay", 5)
+                ],
+                "marital_status": MARITAL_STATUSES[
+                    stable(customer_text + "mar", 2)
+                ],
+            }
+        )
+
+    product_rows: list[dict[str, str]] = []
+    for product_id in sorted(product_ids):
+        supplier_id, supplier_name = SUPPLIERS[stable(product_id, 5)]
+        product_rows.append(
+            {
+                "product_id": product_id,
+                "product_name": product_names.get(product_id) or "UNKNOWN",
+                "product_category": PRODUCT_CATEGORIES[
+                    stable(product_id + "cat", 10)
+                ],
+                "supplier_id": supplier_id,
+                "supplier_name": supplier_name,
+            }
+        )
+
+    return customer_rows, product_rows
+
+
+def write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as target:
+        writer = csv.DictWriter(target, fieldnames=list(fieldnames))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_project_csvs(
+    processed_path: Path,
+    online_path: Path,
+    online_submission_path: Path,
+    customer_path: Path,
+    product_path: Path,
+) -> tuple[int, int]:
+    """Write all CSV deliverables and return customer/product counts."""
+
+    online_columns = [
+        "transaction_id",
+        "customer_id",
+        "product_id",
+        "quantity",
+        "unit_price",
+        "event_time",
+        "sales_mode",
+    ]
+    customer_columns = [
+        "customer_id",
+        "gender",
+        "age_group",
+        "occupation",
+        "city_category",
+        "stay_in_current_city_years",
+        "marital_status",
+    ]
+    product_columns = [
+        "product_id",
+        "product_name",
+        "product_category",
+        "supplier_id",
+        "supplier_name",
+    ]
+
+    customer_rows, product_rows = prepare_master_rows(processed_path)
+    write_csv(customer_path, customer_columns, customer_rows)
+    write_csv(product_path, product_columns, product_rows)
+
+    # online.csv is generated by data_split.py. The submission name required by
+    # the project is online_sales_stream.csv, so preserve both names.
+    shutil.copyfile(online_path, online_submission_path)
+    return len(customer_rows), len(product_rows)
+
+
+def connect_database(config: DatabaseConfig):
+    if psycopg is not None:
+        return psycopg.connect(
+            host=config.host,
+            port=config.port,
+            dbname=config.database,
+            user=config.user,
+            password=config.password,
+        )
+    if psycopg2 is not None:
+        return psycopg2.connect(
+            host=config.host,
+            port=config.port,
+            dbname=config.database,
+            user=config.user,
+            password=config.password,
+        )
+    raise RuntimeError(
+        "Install psycopg (recommended) or psycopg2 before loading PostgreSQL."
+    )
+
+
+def chunks(rows: Sequence[tuple], size: int = INSERT_BATCH_SIZE):
+    for start in range(0, len(rows), size):
+        yield rows[start : start + size]
+
+
+def insert_batches(connection, sql: str, rows: Sequence[tuple]) -> None:
+    with connection.cursor() as cursor:
+        for batch in chunks(rows):
+            cursor.executemany(sql, batch)
+
+
+def load_database(
+    config: DatabaseConfig,
+    online_csv: Path,
+    periodic_csv: Path,
+    customer_csv: Path,
+    product_csv: Path,
+) -> None:
+    """Replace the preparation tables with the current deterministic data."""
+
+    online_rows: list[tuple] = []
+    with online_csv.open("r", encoding="utf-8-sig", newline="") as source:
+        for row in csv.DictReader(source):
+            online_rows.append(
+                (
+                    row["transaction_id"],
+                    parse_event_time(row["event_time"]),
+                    integer_customer_id(row["customer_id"]),
+                    row["product_id"],
+                    int(row["quantity"]),
+                    Decimal(row["unit_price"]),
+                    row["sales_mode"].strip().lower() == "true",
+                )
+            )
+
+    periodic_rows: list[tuple] = []
+    with periodic_csv.open("r", encoding="utf-8-sig", newline="") as source:
+        for row in csv.DictReader(source):
+            periodic_rows.append(
+                (
+                    row["transaction_id"],
+                    parse_event_time(row["event_time"]),
+                    integer_customer_id(row["customer_id"]),
+                    row["product_id"],
+                    int(row["quantity"]),
+                    Decimal(row["unit_price"]),
+                    row["sales_mode"].strip().lower() == "true",
+                    int(row["release_hour"]),
+                    row["released"].strip().lower() == "true",
+                )
+            )
+
+    customer_rows: list[tuple] = []
+    with customer_csv.open("r", encoding="utf-8-sig", newline="") as source:
+        for row in csv.DictReader(source):
+            customer_rows.append(
+                (
+                    integer_customer_id(row["customer_id"]),
+                    row["gender"],
+                    row["age_group"],
+                    row["occupation"],
+                    row["city_category"],
+                    row["stay_in_current_city_years"],
+                    row["marital_status"],
+                )
+            )
+
+    product_rows: list[tuple] = []
+    with product_csv.open("r", encoding="utf-8-sig", newline="") as source:
+        for row in csv.DictReader(source):
+            product_rows.append(
+                (
+                    row["product_id"],
+                    row["product_name"],
+                    row["product_category"],
+                    row["supplier_id"],
+                    row["supplier_name"],
+                )
+            )
+
+    connection = connect_database(config)
+    try:
+        with connection.cursor() as cursor:
+            # Preparation is rerunnable. Existing shed rows refer to periodic
+            # rows, so CASCADE is intentional for this reset operation.
+            cursor.execute(
+                "TRUNCATE TABLE "
+                "oltp_online.online_sales_stream, "
+                "oltp_physical.periodic_sales_data, "
+                "staging_area.customer_master, "
+                "staging_area.product_master "
+                "RESTART IDENTITY CASCADE"
+            )
+
+        insert_batches(
+            connection,
+            """
+            INSERT INTO oltp_online.online_sales_stream
+                (transaction_id, event_time, customer_id, product_id,
+                 quantity, unit_price, sales_mode)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            online_rows,
+        )
+        insert_batches(
+            connection,
+            """
+            INSERT INTO oltp_physical.periodic_sales_data
+                (transaction_id, event_time, customer_id, product_id,
+                 quantity, unit_price, sales_mode, release_hour, released)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            periodic_rows,
+        )
+        insert_batches(
+            connection,
+            """
+            INSERT INTO staging_area.customer_master
+                (customer_id, gender, age_group, occupation, city_category,
+                 stay_in_current_city_years, marital_status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            customer_rows,
+        )
+        insert_batches(
+            connection,
+            """
+            INSERT INTO staging_area.product_master
+                (product_id, product_name, product_category,
+                 supplier_id, supplier_name)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            product_rows,
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    print(f"Loaded online rows: {len(online_rows)}")
+    print(f"Loaded periodic rows: {len(periodic_rows)}")
+    print(f"Loaded customer master rows: {len(customer_rows)}")
+    print(f"Loaded product master rows: {len(product_rows)}")
+
+
+def prompt_or(value: str | None, message: str, default: str | None = None) -> str:
+    if value is not None:
+        return value
+    suffix = f" [{default}]" if default is not None else ""
+    answer = input(f"{message}{suffix}: ").strip()
+    return answer or (default or "")
+
+
+def database_config_from_args(args: argparse.Namespace) -> DatabaseConfig:
+    host = prompt_or(args.host, "PostgreSQL host", "localhost")
+    port = int(prompt_or(args.port, "PostgreSQL port", "5432"))
+    database = prompt_or(args.database, "Database name")
+    user = prompt_or(args.user, "Database user")
+    password = args.password if args.password is not None else getpass("Database password: ")
+    return DatabaseConfig(host, port, database, user, password)
+
+
+def parse_args() -> argparse.Namespace:
+    root = project_root()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, default=root / "data" / "raw" / "online-retail.csv")
+    parser.add_argument("--host")
+    parser.add_argument("--port")
+    parser.add_argument("--database")
+    parser.add_argument("--user")
+    parser.add_argument("--password")
+    parser.add_argument("--skip-db", action="store_true", help="Only create CSVs; do not connect to PostgreSQL.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    root = project_root()
+    static = root / "data" / "static"
+    processed = static / "processed-retail.csv"
+    online = static / "online.csv"
+    periodical = static / "periodical.csv"
+    online_submission = static / "online_sales_stream.csv"
+    customer_csv = static / "customer_master_data.csv"
+    product_csv = static / "product_master_data.csv"
+
+    total, valid, duplicates, written = clean_file(args.input, processed)
+    online_count, periodic_count = split_file(processed, online, periodical)
+    customer_count, product_count = write_project_csvs(
+        processed,
+        online,
+        online_submission,
+        customer_csv,
+        product_csv,
+    )
+
+    print(f"Rows read before cleaning: {total}")
+    print(f"Rows passing cleaning rules: {valid}")
+    print(f"Exact duplicate rows removed: {duplicates}")
+    print(f"Rows written after cleaning: {written}")
+    print(f"Online rows prepared: {online_count}")
+    print(f"Periodic rows prepared: {periodic_count}")
+    print(f"Customer master CSV rows: {customer_count}")
+    print(f"Product master CSV rows: {product_count}")
+
+    if not args.skip_db:
+        config = database_config_from_args(args)
+        load_database(config, online_submission, periodical, customer_csv, product_csv)
+    else:
+        print("Database loading skipped (--skip-db).")
+
+
+if __name__ == "__main__":
+    main()
+
