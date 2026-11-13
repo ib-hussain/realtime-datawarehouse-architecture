@@ -7,6 +7,9 @@
 #include <cerrno>       // errno
 #include <cstring> 
 #include <unistd.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <sstream>
@@ -18,7 +21,7 @@
 using namespace std;
 #include <semaphore.h>
 #include <semaphore>
-
+// i want to implement threading
 // counting_semaphore<3> parkingSpots(3);// Counting semaphore with 3 available parking spots
 // void parking(const string& employee, int carNumber) {
 //     cout << employee << " (Car " << carNumber << ") wants to park.\n";

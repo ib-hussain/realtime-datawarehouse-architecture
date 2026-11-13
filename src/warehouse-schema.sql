@@ -1,3 +1,4 @@
+-- Active: 1794590548890@@127.0.0.1@5432@realtime_data_stream
 -- ============================================================================
 -- PROJECT: Near-Real-Time and Periodic Data Warehouse for a Retail Chain
 -- DBMS: PostgreSQL
@@ -11,9 +12,7 @@
 --   * data_warehouse.products_store is the product-store bridge.
 --   * data_warehouse.fact_sales is a compatibility view, not a second fact.
 -- ============================================================================
-
 BEGIN;
-
 -- ============================================================================
 -- 0. CLEAN REBUILD
 -- Dropping data_warehouse also removes STORE_QUARTERLY_SALES if Q20 created it.

@@ -2,7 +2,8 @@
 #define DISK_BUFFER_H
 
 #include "base.h"
-
+// for this file i was thinking how about we actually load make this a program and use it and upload it to ram 
+// and we can control max ram allocation and we can compile and use this using cpython in python files??
 
 
 

@@ -6,3 +6,4 @@ New Microsoft Word Document.docx
 *.o
 *vscode*/
 raw/
+.env*

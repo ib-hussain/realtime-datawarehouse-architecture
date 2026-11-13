@@ -1,7 +1,0 @@
-PS D:\Downloads\Repositories\datawarehouseProject> python data/static/data_split.py
-Online rows written: 275154
-Periodic rows written: 117538
-Periodic release groups: 48
-Online file: D:\Downloads\Repositories\datawarehouseProject\data\static\online.csv
-Periodic file: D:\Downloads\Repositories\datawarehouseProject\data\static\periodical.csv
-PS D:\Downloads\Repositories\datawarehouseProject> 

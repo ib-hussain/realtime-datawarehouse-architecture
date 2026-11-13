@@ -1,7 +1,0 @@
-PS D:\Downloads\Repositories\datawarehouseProject> python data/static/clean_data.py
-Rows read before cleaning: 541909
-Rows passing project cleaning rules: 397884
-Exact duplicate rows removed: 5192
-Rows written after cleaning: 392692
-Processed file: D:\Downloads\Repositories\datawarehouseProject\data\static\processed-retail.csv
-PS D:\Downloads\Repositories\datawarehouseProject> 

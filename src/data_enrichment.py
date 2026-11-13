@@ -1,1 +1,1 @@
-# the join happens here and data is enriched then
+# the join happens here and data is enriched then in this file. Then it is also loaded in this file.
