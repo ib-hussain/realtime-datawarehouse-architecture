@@ -1,0 +1,1 @@
+# write all output files as <filename>.ext.o
