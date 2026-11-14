@@ -1,4 +1,3 @@
--- Active: 1794590548890@@127.0.0.1@5432@realtime_data_stream
 -- ============================================================================
 -- PROJECT: Near-Real-Time and Periodic Data Warehouse for a Retail Chain
 -- DBMS: PostgreSQL
@@ -12,8 +11,9 @@
 --   * data_warehouse.products_store is the product-store bridge.
 --   * data_warehouse.fact_sales is a compatibility view, not a second fact.
 -- ============================================================================
-CREATE DATABASE IF NOT EXISTS realtime_data_stream
+-- CREATE DATABASE IF NOT EXISTS realtime_data_stream
 BEGIN;
+
 -- ============================================================================
 -- 0. CLEAN REBUILD
 -- Dropping data_warehouse also removes STORE_QUARTERLY_SALES if Q20 created it.
@@ -366,6 +366,26 @@ CREATE TABLE data_warehouse.transactions (
             product_store_key, product_id, store_id
         )
 );
+
+-- Bonus: joined online rows wait in a durable cache until non-peak periods.
+CREATE TABLE data_warehouse.live_cache (
+    cache_id BIGSERIAL PRIMARY KEY,
+    transaction_id VARCHAR(20) NOT NULL,
+    customer_id BIGINT NOT NULL,
+    product_id VARCHAR(255) NOT NULL,
+    supplier_id data_warehouse.supplier_id_enum NOT NULL,
+    store_id SMALLINT NOT NULL,
+    time_key BIGINT NOT NULL,
+    product_store_key BIGINT NOT NULL,
+    event_time TIMESTAMP NOT NULL,
+    quantity INTEGER NOT NULL,
+    unit_price NUMERIC(12,3) NOT NULL,
+    revenue NUMERIC(18,3) NOT NULL,
+    sales_mode BOOLEAN NOT NULL DEFAULT TRUE CHECK (sales_mode),
+    processing_mode data_warehouse.processing_mode_enum NOT NULL DEFAULT 'Immediate',
+    cached_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_live_cache_pending ON data_warehouse.live_cache(cache_id);
 
 -- Compatibility name for code or OLAP scripts written against fact_sales.
 -- This is a view over transactions, so there is still exactly one fact table.
