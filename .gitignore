@@ -8,3 +8,15 @@ New Microsoft Word Document.docx
 raw/
 .env*
 !.env.example
+report**
+.env
+__pycache__/
+*.pyc
+.venv/
+logs/
+data/raw/
+data/dynamic/*.csv
+data/dynamic/*.json
+DWBI_Observatory/
+*.zip
+
