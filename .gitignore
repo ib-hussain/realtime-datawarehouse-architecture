@@ -19,4 +19,4 @@ data/dynamic/*.csv
 data/dynamic/*.json
 DWBI**Observatory/
 *.zip
-
+skills/

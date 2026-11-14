@@ -19,6 +19,8 @@ except ImportError:  # pragma: no cover - depends on the local machine.
 
 @dataclass(frozen=True)
 class DatabaseConfig:
+    """Credentials and network location for the PostgreSQL database."""
+
     host: str
     port: int
     database: str
@@ -28,6 +30,8 @@ class DatabaseConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
+    """Database connection and tunable runtime parameters."""
+
     database: DatabaseConfig
     online_file: Path
     master_partition_size: int = 500
@@ -40,11 +44,12 @@ class RuntimeConfig:
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    """Return the repository root based on this module's location."""
+    return Path(__file__).resolve().parents[1]
 
 
 def load_env_file(path: Path) -> dict[str, str]:
-    """Read the small KEY=VALUE .env format used by this project."""
+    """Read KEY=VALUE settings, preferring already-set process variables."""
 
     values = dict(os.environ)
     if not path.exists():
@@ -59,6 +64,7 @@ def load_env_file(path: Path) -> dict[str, str]:
 
 
 def require(values: dict[str, str], key: str) -> str:
+    """Return a required, non-empty setting or raise a configuration error."""
     value = values.get(key, "").strip()
     if not value:
         raise ValueError(f"Missing {key} in .env or environment.")
@@ -66,8 +72,10 @@ def require(values: dict[str, str], key: str) -> str:
 
 
 def load_runtime_config(env_path: Path | None = None) -> RuntimeConfig:
+    """Load database credentials and runtime options from an environment file."""
     root = project_root()
-    values = load_env_file(env_path or root / ".env")
+    env_path = env_path or root / ".env"
+    values = load_env_file(env_path)
     online_file = Path(require(values, "ONLINE_SALES_FILE"))
     if not online_file.is_absolute():
         online_file = root / online_file
@@ -92,6 +100,7 @@ def load_runtime_config(env_path: Path | None = None) -> RuntimeConfig:
 
 
 def connect_database(config: DatabaseConfig):
+    """Open a PostgreSQL connection using an installed supported driver."""
     if psycopg is not None:
         return psycopg.connect(
             host=config.host,

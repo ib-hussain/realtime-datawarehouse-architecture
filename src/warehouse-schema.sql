@@ -1,3 +1,4 @@
+-- Active: 1794590548890@@127.0.0.1@5432@realtime_data_stream
 -- ============================================================================
 -- PROJECT: Near-Real-Time and Periodic Data Warehouse for a Retail Chain
 -- DBMS: PostgreSQL
