@@ -101,10 +101,12 @@ class WarehouseLoader:
         database: DatabaseConfig,
         stores: dict[int, tuple[str, str]],
         flush_size: int = 500,
+        bonus_cache: bool = True,
     ) -> None:
         self._connection = connect_database(database)
         self._stores = stores
         self.flush_size = flush_size
+        self.bonus_cache = bonus_cache
         self._known_customers: set[int] = set()
         self._known_products: set[str] = set()
         self._known_suppliers: set[str] = set()
@@ -112,6 +114,8 @@ class WarehouseLoader:
         self._time_keys: dict[datetime, int] = {}
         self._product_store_keys: dict[tuple[str, int], int] = {}
         self._facts: list[tuple] = []
+        self._online_cache: list[tuple] = []
+        self.cached_count = 0
         self.loaded_count = 0
 
     def stage(self, transaction: Transaction) -> None:
@@ -119,7 +123,8 @@ class WarehouseLoader:
         store_id = store_id_for(transaction.transaction_id, transaction.sales_mode)
         time_key = self._time_keys[transaction.event_time]
         product_store_key = self._product_store_keys[(transaction.product_id, store_id)]
-        self._facts.append(
+        target = self._online_cache if (self.bonus_cache and transaction.sales_mode) else self._facts
+        target.append(
             (
                 transaction.transaction_id,
                 transaction.customer_id,
@@ -136,26 +141,54 @@ class WarehouseLoader:
                 transaction.processing_mode,
             )
         )
-        if len(self._facts) >= self.flush_size:
+        if len(self._facts) + len(self._online_cache) >= self.flush_size:
             self.flush()
 
     def flush(self) -> None:
-        if not self._facts:
+        if not self._facts and not self._online_cache:
             return
-        with self._connection.cursor() as cursor:
-            cursor.executemany(
-                """
-                INSERT INTO data_warehouse.transactions
-                    (transaction_id, customer_id, product_id, supplier_id,
-                     store_id, time_key, product_store_key, event_time,
-                     quantity, unit_price, revenue, sales_mode, processing_mode)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                self._facts,
-            )
-        self._connection.commit()
+        columns = "(transaction_id, customer_id, product_id, supplier_id, store_id, time_key, product_store_key, event_time, quantity, unit_price, revenue, sales_mode, processing_mode)"
+        values = "(" + ", ".join(["%s"] * 13) + ")"
+        try:
+            with self._connection.cursor() as cursor:
+                if self._facts:
+                    cursor.executemany("INSERT INTO data_warehouse.transactions " + columns + " VALUES " + values, self._facts)
+                if self._online_cache:
+                    cursor.executemany("INSERT INTO data_warehouse.live_cache " + columns + " VALUES " + values, self._online_cache)
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
         self.loaded_count += len(self._facts)
+        self.cached_count += len(self._online_cache)
         self._facts.clear()
+        self._online_cache.clear()
+
+    def drain_cache(self, limit: int = 500) -> int:
+        """Atomically move cached online rows to fact during non-peak operation."""
+        self.flush()
+        fields = "transaction_id, customer_id, product_id, supplier_id, store_id, time_key, product_store_key, event_time, quantity, unit_price, revenue, sales_mode, processing_mode"
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(f"""
+                    WITH selected AS (
+                        SELECT cache_id FROM data_warehouse.live_cache
+                        ORDER BY cache_id LIMIT %s FOR UPDATE SKIP LOCKED
+                    ), moved AS (
+                        DELETE FROM data_warehouse.live_cache c
+                        USING selected s WHERE c.cache_id = s.cache_id
+                        RETURNING c.{', c.'.join(fields.split(', '))}
+                    )
+                    INSERT INTO data_warehouse.transactions ({fields})
+                    SELECT {fields} FROM moved
+                """, (limit,))
+                count = cursor.rowcount
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        self.loaded_count += count
+        return count
 
     def close(self) -> None:
         self.flush()
@@ -407,6 +440,8 @@ class MeshJoinWorker:
                 for transaction in product_ready:
                     loader.stage(transaction)
 
+                if not self.state.is_peak():
+                    loader.drain_cache(self.runtime.stream_chunk_size)
                 self.loaded_to_warehouse = loader.loaded_count
 
                 if not self.state.is_peak() and self.buffer.qsize() < self.buffer.maxsize // 4:

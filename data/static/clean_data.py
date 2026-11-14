@@ -80,7 +80,7 @@ def clean_file(input_path: Path, output_path: Path) -> tuple[int, int, int, int]
     written_rows = 0
     seen_rows: set[tuple[str | None, ...]] = set()
 
-    with input_path.open("r", encoding="cp1252", newline="") as source:
+    with input_path.open("r", encoding="utf-8-sig", newline="") as source:
         reader = csv.DictReader(source)
         if reader.fieldnames is None:
             raise ValueError("The input CSV has no header row.")

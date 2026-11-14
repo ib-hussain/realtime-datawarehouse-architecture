@@ -12,6 +12,9 @@ Commands while running:
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
+import json
+from pathlib import Path
 import threading
 import time
 
@@ -23,8 +26,10 @@ from meshjoin.streamer import OnlineThread, PeriodicThread, RuntimeState
 
 
 class DataEnrichmentApplication:
-    def __init__(self, arrival_mode: str) -> None:
+    def __init__(self, arrival_mode: str, online_file: Path | None = None) -> None:
         self.runtime = load_runtime_config()
+        if online_file is not None:
+            self.runtime = replace(self.runtime, online_file=online_file.resolve())
         self.state = RuntimeState(arrival_mode)
         self.buffer = PriorityStreamBuffer(self.runtime.stream_buffer_limit)
         self.online: OnlineThread | None = None
@@ -106,6 +111,30 @@ class DataEnrichmentApplication:
             elif command:
                 print("Unknown command. Use: online, periodic, both, peak, non-peak, status, quit")
 
+    def watch_commands(self, control_file: Path) -> None:
+        """Consume atomic JSON commands from the dashboard or CLI."""
+        last_id = None
+        while not self.state.stop_event.wait(0.3):
+            try:
+                payload = json.loads(control_file.read_text(encoding="utf-8"))
+                if payload.get("id") == last_id:
+                    continue
+                last_id = payload.get("id")
+                command = payload.get("command")
+                if command in ("online", "periodic", "both"):
+                    self.state.set_source_mode(command)
+                elif command in ("peak", "non-peak"):
+                    self.state.set_arrival_mode(command)
+                elif command == "quit":
+                    self.state.stop()
+                elif command == "status":
+                    self.status()
+                else:
+                    print(f"Ignored unrecognized control command: {command!r}")
+                print(f"CONTROL | {command}", flush=True)
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                continue
+
     def run_without_console(self) -> None:
         """Keep threads alive for an external controller or test harness."""
 
@@ -154,6 +183,8 @@ def parse_args() -> argparse.Namespace:
         default="peak",
         help="Initial online-stream rate mode (default: peak).",
     )
+    parser.add_argument("--online-file", type=Path, default=None)
+    parser.add_argument("--control-file", type=Path, default=None)
     parser.add_argument(
         "--no-console",
         action="store_true",
@@ -164,9 +195,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    application = DataEnrichmentApplication(args.arrival_mode)
+    application = DataEnrichmentApplication(args.arrival_mode, args.online_file)
     try:
         application.start()
+        if args.control_file:
+            threading.Thread(target=application.watch_commands, args=(args.control_file,), daemon=True).start()
         if args.no_console:
             application.run_without_console()
         else:

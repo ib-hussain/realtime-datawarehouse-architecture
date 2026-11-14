@@ -17,6 +17,6 @@ logs/
 data/raw/
 data/dynamic/*.csv
 data/dynamic/*.json
-DWBI_Observatory/
+DWBI**Observatory/
 *.zip
 

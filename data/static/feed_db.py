@@ -38,8 +38,12 @@ try:  # psycopg2 is supported as a fallback.
 except ImportError:  # pragma: no cover - depends on the user's environment.
     psycopg2 = None
 
-from clean_data import clean_file
-from data_split import split_file
+try:
+    from .clean_data import clean_file
+    from .data_split import split_file
+except ImportError:  # Standalone execution
+    from clean_data import clean_file
+    from data_split import split_file
 
 
 DATE_FORMAT = "%d/%m/%Y %H:%M"

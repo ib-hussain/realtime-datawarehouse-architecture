@@ -402,6 +402,17 @@ def main() -> None:
         user=prompt_or(args.user, "Database user"),
         password=args.password if args.password is not None else getpass("Database password: "),
     )
+    if args.dynamic_source:
+        from data.dynamic.feed_db import run as dynamic_prepare
+        if args.dynamic_output_dir.resolve() == args.dynamic_source.resolve():
+            raise ValueError('Dynamic input and output directory must differ')
+        # This operation replaces the input tables. Never run it concurrently
+        # with the warehouse enrichment process.
+        from observatory import is_running
+        if is_running():
+            raise RuntimeError('Stop the MESHJOIN runtime before preparing dynamic sources')
+        result = dynamic_prepare(args.dynamic_source, args.dynamic_output_dir, config)
+        print('Dynamic feed prepared:', result)
     buffer = StreamBuffer(args.buffer_size)
     stop_event = threading.Event()
 
