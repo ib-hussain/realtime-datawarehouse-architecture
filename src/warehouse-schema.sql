@@ -12,6 +12,7 @@
 --   * data_warehouse.products_store is the product-store bridge.
 --   * data_warehouse.fact_sales is a compatibility view, not a second fact.
 -- ============================================================================
+CREATE DATABASE IF NOT EXISTS realtime_data_stream
 BEGIN;
 -- ============================================================================
 -- 0. CLEAN REBUILD
