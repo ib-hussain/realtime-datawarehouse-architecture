@@ -8,10 +8,10 @@ import threading
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import ClassVar
 
 from meshjoin.base import DatabaseConfig, connect_database
 from meshjoin.stream_buffer import PriorityStreamBuffer, Transaction
-
 
 DATE_FORMAT = "%d/%m/%Y %H:%M"
 
@@ -19,10 +19,12 @@ DATE_FORMAT = "%d/%m/%Y %H:%M"
 class RuntimeState:
     """Thread-safe command state shared by the three project threads."""
 
-    VALID_SOURCES = {"online", "periodic", "both"}
-    VALID_RATES = {"peak", "non-peak"}
+    VALID_SOURCES: ClassVar[frozenset[str]] = frozenset({"online", "periodic", "both"})
+    VALID_RATES: ClassVar[frozenset[str]] = frozenset({"peak", "non-peak"})
 
     def __init__(self, arrival_mode: str = "peak") -> None:
+        if arrival_mode not in self.VALID_RATES:
+            raise ValueError(f"Unknown arrival mode: {arrival_mode}")
         self._mode = "both"
         self._arrival_mode = arrival_mode
         self._condition = threading.Condition()
@@ -82,7 +84,7 @@ class ShedRepository:
         self._connection = connect_database(database)
 
     def shed(self, transaction: Transaction) -> None:
-        if transaction.source != "periodic" or transaction.source_row_id is None:
+        if transaction.source != "periodic":
             raise ValueError("Only a periodic row with periodic_row_id may be shed.")
         with self._connection.cursor() as cursor:
             cursor.execute(
@@ -108,7 +110,7 @@ class ShedRepository:
         self._connection.commit()
 
     def load_when_idle(self, buffer: PriorityStreamBuffer, limit: int = 500) -> int:
-        """Move shed rows back into memory and mark only inserted rows done."""
+        """Claim shed rows only after they have entered the in-memory buffer."""
 
         with self._connection.cursor() as cursor:
             cursor.execute(
@@ -117,7 +119,7 @@ class ShedRepository:
                        customer_id, product_id, quantity, unit_price,
                        sales_mode, release_hour
                 FROM waiting_area.shed_table_physical
-                WHERE processed = FALSE
+                WHERE processed = FALSE AND in_progress = FALSE
                 ORDER BY shed_at, shed_id
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED
@@ -126,7 +128,7 @@ class ShedRepository:
             )
             rows = cursor.fetchall()
 
-            completed_ids: list[int] = []
+            claimed_ids: list[int] = []
             for row in rows:
                 (
                     shed_id,
@@ -155,19 +157,34 @@ class ShedRepository:
                 )
                 if not buffer.try_put(transaction):
                     break
-                completed_ids.append(int(shed_id))
+                claimed_ids.append(int(shed_id))
 
-            if completed_ids:
+            if claimed_ids:
                 cursor.execute(
                     """
                     UPDATE waiting_area.shed_table_physical
-                    SET processed = TRUE, processed_at = CURRENT_TIMESTAMP
+                    SET in_progress = TRUE, claimed_at = CURRENT_TIMESTAMP
                     WHERE shed_id = ANY(%s)
                     """,
-                    (completed_ids,),
+                    (claimed_ids,),
                 )
         self._connection.commit()
-        return len(completed_ids)
+        return len(claimed_ids)
+
+    def release_stale_claims(self) -> int:
+        """Make uncommitted claims from an earlier crashed worker recoverable."""
+
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE waiting_area.shed_table_physical
+                SET in_progress = FALSE, claimed_at = NULL
+                WHERE processed = FALSE AND in_progress = TRUE
+                """
+            )
+            count = max(0, cursor.rowcount)
+        self._connection.commit()
+        return count
 
     def pending_count(self) -> int:
         with self._connection.cursor() as cursor:
@@ -203,12 +220,12 @@ class OnlineThread(threading.Thread):
     def run(self) -> None:
         try:
             with self.online_file.open("r", encoding="utf-8-sig", newline="") as source:
-                for row in csv.DictReader(source):
+                for source_row_id, row in enumerate(csv.DictReader(source), start=1):
                     if not self.state.wait_until_allowed("online"):
                         return
                     transaction = Transaction(
                         source="online",
-                        source_row_id=None,
+                        source_row_id=source_row_id,
                         transaction_id=row["transaction_id"].strip(),
                         event_time=datetime.strptime(row["event_time"].strip(), DATE_FORMAT),
                         customer_id=int(Decimal(row["customer_id"])),
@@ -253,14 +270,17 @@ class PeriodicThread(threading.Thread):
         connection = connect_database(self.database)
         shed = ShedRepository(self.database)
         try:
-            for group in range(self.group_count):
+            groups = self._pending_groups(connection)
+            for index, group in enumerate(groups):
                 if not self.state.wait_until_allowed("periodic"):
                     return
                 loaded, shed_count = self._extract_group(connection, shed, group)
                 self.rows_loaded += loaded
                 self.rows_shed += shed_count
                 self.groups_released += 1
-                if self.state.stop_event.wait(self.simulated_hour_seconds):
+                if index < len(groups) - 1 and self.state.stop_event.wait(
+                    self.simulated_hour_seconds
+                ):
                     return
         except Exception as error:
             self.error = error
@@ -268,6 +288,28 @@ class PeriodicThread(threading.Thread):
         finally:
             shed.close()
             connection.close()
+
+    def _pending_groups(self, connection) -> list[int]:
+        """Resume at unreleased groups instead of replaying completed-hour waits."""
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT DISTINCT periodic.release_hour
+                FROM oltp_physical.periodic_sales_data periodic
+                WHERE periodic.released = FALSE
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM waiting_area.shed_table_physical shed
+                      WHERE shed.periodic_row_id = periodic.periodic_row_id
+                        AND shed.processed = FALSE
+                  )
+                ORDER BY periodic.release_hour
+                """
+            )
+            groups = [int(row[0]) for row in cursor.fetchall()]
+        connection.commit()
+        return groups
 
     def _extract_group(self, connection, shed: ShedRepository, group: int) -> tuple[int, int]:
         with connection.cursor() as cursor:
@@ -277,11 +319,18 @@ class PeriodicThread(threading.Thread):
                        product_id, quantity, unit_price, sales_mode, release_hour
                 FROM oltp_physical.periodic_sales_data
                 WHERE released = FALSE AND release_hour = %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM waiting_area.shed_table_physical shed
+                      WHERE shed.periodic_row_id = periodic_sales_data.periodic_row_id
+                        AND shed.processed = FALSE
+                  )
                 ORDER BY event_time, periodic_row_id
                 """,
                 (group,),
             )
             rows = cursor.fetchall()
+        connection.commit()
 
         loaded = 0
         shed_count = 0
@@ -317,15 +366,4 @@ class PeriodicThread(threading.Thread):
             else:
                 return loaded, shed_count
 
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE oltp_physical.periodic_sales_data
-                SET released = TRUE
-                WHERE released = FALSE AND release_hour = %s
-                """,
-                (group,),
-            )
-        connection.commit()
         return loaded, shed_count
-

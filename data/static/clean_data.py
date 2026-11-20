@@ -14,7 +14,6 @@ import csv
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-
 REQUIRED_COLUMNS = {
     "InvoiceNo",
     "StockCode",
@@ -88,8 +87,7 @@ def clean_file(input_path: Path, output_path: Path) -> tuple[int, int, int, int]
         missing = REQUIRED_COLUMNS.difference(reader.fieldnames)
         if missing:
             raise ValueError(
-                "The input CSV is missing required columns: "
-                + ", ".join(sorted(missing))
+                "The input CSV is missing required columns: " + ", ".join(sorted(missing))
             )
 
         with output_path.open("w", encoding="utf-8", newline="") as target:
@@ -141,9 +139,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    total_rows, valid_rows, duplicate_rows, written_rows = clean_file(
-        args.input, args.output
-    )
+    total_rows, valid_rows, duplicate_rows, written_rows = clean_file(args.input, args.output)
 
     print(f"Rows read before cleaning: {total_rows}")
     print(f"Rows passing project cleaning rules: {valid_rows}")
@@ -154,4 +150,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

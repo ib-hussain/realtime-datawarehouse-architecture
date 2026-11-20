@@ -65,8 +65,7 @@ def load_stores(database: DatabaseConfig) -> dict[int, tuple[str, str]]:
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT store_id, store_name, city "
-                "FROM staging_area.store_list ORDER BY store_id"
+                "SELECT store_id, store_name, city FROM staging_area.store_list ORDER BY store_id"
             )
             rows = cursor.fetchall()
         stores = {int(store_id): (str(name), str(city)) for store_id, name, city in rows}
@@ -75,4 +74,3 @@ def load_stores(database: DatabaseConfig) -> dict[int, tuple[str, str]]:
         return stores
     finally:
         connection.close()
-

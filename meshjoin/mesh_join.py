@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
+import time
 from collections import deque
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
-import time
-from typing import Callable, Hashable
 
 from meshjoin.base import DatabaseConfig, RuntimeConfig, connect_database
 from meshjoin.master_data import MasterDataPager
@@ -115,6 +114,8 @@ class WarehouseLoader:
         self._product_store_keys: dict[tuple[str, int], int] = {}
         self._facts: list[tuple] = []
         self._online_cache: list[tuple] = []
+        self._periodic_source_ids: list[int] = []
+        self._shed_source_ids: list[int] = []
         self.cached_count = 0
         self.loaded_count = 0
 
@@ -123,10 +124,15 @@ class WarehouseLoader:
         store_id = store_id_for(transaction.transaction_id, transaction.sales_mode)
         time_key = self._time_keys[transaction.event_time]
         product_store_key = self._product_store_keys[(transaction.product_id, store_id)]
-        target = self._online_cache if (self.bonus_cache and transaction.sales_mode) else self._facts
+        source_type = "online" if transaction.source == "online" else "periodic"
+        target = (
+            self._online_cache if (self.bonus_cache and transaction.sales_mode) else self._facts
+        )
         target.append(
             (
                 transaction.transaction_id,
+                source_type,
+                transaction.source_row_id,
                 transaction.customer_id,
                 transaction.product_id,
                 transaction.supplier_id,
@@ -141,47 +147,102 @@ class WarehouseLoader:
                 transaction.processing_mode,
             )
         )
+        if source_type == "periodic":
+            self._periodic_source_ids.append(transaction.source_row_id)
+        if transaction.source == "shed":
+            self._shed_source_ids.append(transaction.source_row_id)
         if len(self._facts) + len(self._online_cache) >= self.flush_size:
             self.flush()
 
     def flush(self) -> None:
         if not self._facts and not self._online_cache:
             return
-        columns = "(transaction_id, customer_id, product_id, supplier_id, store_id, time_key, product_store_key, event_time, quantity, unit_price, revenue, sales_mode, processing_mode)"
-        values = "(" + ", ".join(["%s"] * 13) + ")"
+        columns = "(transaction_id, source_type, source_row_id, customer_id, product_id, supplier_id, store_id, time_key, product_store_key, event_time, quantity, unit_price, revenue, sales_mode, processing_mode)"
+        values = "(" + ", ".join(["%s"] * 15) + ")"
+        facts_inserted = 0
+        cache_inserted = 0
         try:
             with self._connection.cursor() as cursor:
                 if self._facts:
-                    cursor.executemany("INSERT INTO data_warehouse.transactions " + columns + " VALUES " + values, self._facts)
+                    cursor.executemany(
+                        "INSERT INTO data_warehouse.transactions "
+                        + columns
+                        + " VALUES "
+                        + values
+                        + " ON CONFLICT (source_type, source_row_id) DO NOTHING",
+                        self._facts,
+                    )
+                    facts_inserted = max(0, cursor.rowcount)
                 if self._online_cache:
-                    cursor.executemany("INSERT INTO data_warehouse.live_cache " + columns + " VALUES " + values, self._online_cache)
+                    cursor.executemany(
+                        "INSERT INTO data_warehouse.live_cache "
+                        + columns
+                        + " SELECT incoming.* FROM (VALUES "
+                        + values
+                        + ") AS incoming(transaction_id, source_type, source_row_id, "
+                        "customer_id, product_id, supplier_id, store_id, time_key, "
+                        "product_store_key, event_time, quantity, unit_price, revenue, "
+                        "sales_mode, processing_mode) WHERE NOT EXISTS (SELECT 1 FROM "
+                        "data_warehouse.transactions fact WHERE fact.source_type = "
+                        "incoming.source_type AND fact.source_row_id = incoming.source_row_id)"
+                        + " ON CONFLICT (source_type, source_row_id) DO NOTHING",
+                        self._online_cache,
+                    )
+                    cache_inserted = max(0, cursor.rowcount)
+                if self._periodic_source_ids:
+                    cursor.execute(
+                        """
+                        UPDATE oltp_physical.periodic_sales_data
+                        SET released = TRUE
+                        WHERE periodic_row_id = ANY(%s)
+                        """,
+                        (self._periodic_source_ids,),
+                    )
+                if self._shed_source_ids:
+                    cursor.execute(
+                        """
+                        UPDATE waiting_area.shed_table_physical
+                        SET processed = TRUE,
+                            in_progress = FALSE,
+                            claimed_at = NULL,
+                            processed_at = CURRENT_TIMESTAMP
+                        WHERE periodic_row_id = ANY(%s)
+                        """,
+                        (self._shed_source_ids,),
+                    )
             self._connection.commit()
         except Exception:
             self._connection.rollback()
             raise
-        self.loaded_count += len(self._facts)
-        self.cached_count += len(self._online_cache)
+        self.loaded_count += facts_inserted
+        self.cached_count += cache_inserted
         self._facts.clear()
         self._online_cache.clear()
+        self._periodic_source_ids.clear()
+        self._shed_source_ids.clear()
 
     def drain_cache(self, limit: int = 500) -> int:
         """Atomically move cached online rows to fact during non-peak operation."""
         self.flush()
-        fields = "transaction_id, customer_id, product_id, supplier_id, store_id, time_key, product_store_key, event_time, quantity, unit_price, revenue, sales_mode, processing_mode"
+        fields = "transaction_id, source_type, source_row_id, customer_id, product_id, supplier_id, store_id, time_key, product_store_key, event_time, quantity, unit_price, revenue, sales_mode, processing_mode"
         try:
             with self._connection.cursor() as cursor:
-                cursor.execute(f"""
+                cursor.execute(
+                    f"""
                     WITH selected AS (
                         SELECT cache_id FROM data_warehouse.live_cache
                         ORDER BY cache_id LIMIT %s FOR UPDATE SKIP LOCKED
                     ), moved AS (
                         DELETE FROM data_warehouse.live_cache c
                         USING selected s WHERE c.cache_id = s.cache_id
-                        RETURNING c.{', c.'.join(fields.split(', '))}
+                        RETURNING c.{", c.".join(fields.split(", "))}
                     )
                     INSERT INTO data_warehouse.transactions ({fields})
                     SELECT {fields} FROM moved
-                """, (limit,))
+                    ON CONFLICT (source_type, source_row_id) DO NOTHING
+                """,
+                    (limit,),
+                )
                 count = cursor.rowcount
             self._connection.commit()
         except Exception:
@@ -312,9 +373,12 @@ class WarehouseLoader:
         )
         month = event_time.month
         season = (
-            "Spring" if month in (3, 4, 5)
-            else "Summer" if month in (6, 7, 8)
-            else "Fall" if month in (9, 10, 11)
+            "Spring"
+            if month in (3, 4, 5)
+            else "Summer"
+            if month in (6, 7, 8)
+            else "Fall"
+            if month in (9, 10, 11)
             else "Winter"
         )
         return (
@@ -353,6 +417,7 @@ class MeshJoinWorker:
         self.error: Exception | None = None
 
     def run(self) -> None:
+        lock_connection = None
         customer_pager: MasterDataPager | None = None
         product_pager: MasterDataPager | None = None
         customer_pass: MeshJoinPass | None = None
@@ -360,6 +425,16 @@ class MeshJoinWorker:
         loader: WarehouseLoader | None = None
         shed: ShedRepository | None = None
         try:
+            lock_connection = connect_database(self.runtime.database)
+            with lock_connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(%s)", (1_146_569_289,))
+                acquired = bool(cursor.fetchone()[0])
+            lock_connection.commit()
+            if not acquired:
+                raise RuntimeError(
+                    "Another MESHJOIN worker already holds the database runtime lock."
+                )
+
             customer_pager = MasterDataPager(
                 self.runtime.database,
                 "staging_area.customer_master",
@@ -395,11 +470,14 @@ class MeshJoinWorker:
                 self.runtime.stream_chunk_size,
             )
             shed = ShedRepository(self.runtime.database)
+            recovered_claims = shed.release_stale_claims()
             print(
                 "MESHJOIN partitions: "
                 f"customer={customer_pager.partition_count}, "
                 f"product={product_pager.partition_count}"
             )
+            if recovered_claims:
+                print(f"Recovered {recovered_claims} uncommitted shed claims.")
             pending_input: list[Transaction] = []
             pending_since: float | None = None
             while not self.state.stop_event.is_set():
@@ -473,6 +551,8 @@ class MeshJoinWorker:
                 customer_pager.close()
             if product_pager is not None:
                 product_pager.close()
+            if lock_connection is not None:
+                lock_connection.close()
 
     @staticmethod
     def _enrich_customer(transaction: Transaction, master: tuple) -> None:
@@ -495,4 +575,3 @@ class MeshJoinWorker:
             transaction.supplier_id,
             transaction.supplier_name,
         ) = master
-

@@ -16,7 +16,6 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 
-
 ONLINE_COLUMNS = [
     "transaction_id",
     "customer_id",
@@ -27,7 +26,7 @@ ONLINE_COLUMNS = [
     "sales_mode",
 ]
 
-PERIODIC_COLUMNS = ONLINE_COLUMNS + ["release_hour", "released"]
+PERIODIC_COLUMNS = [*ONLINE_COLUMNS, "release_hour", "released"]
 GROUP_COUNT = 48
 DATE_FORMAT = "%d/%m/%Y %H:%M"
 
@@ -58,9 +57,7 @@ def required_value(row: dict[str, str | None], column: str, row_number: int) -> 
     return value.strip()
 
 
-def split_file(
-    input_path: Path, online_path: Path, periodic_path: Path
-) -> tuple[int, int]:
+def split_file(input_path: Path, online_path: Path, periodic_path: Path) -> tuple[int, int]:
     online_rows: list[dict[str, str]] = []
     periodic_rows: list[tuple[datetime, int, dict[str, str]]] = []
 
@@ -80,8 +77,7 @@ def split_file(
         missing = expected_columns.difference(reader.fieldnames)
         if missing:
             raise ValueError(
-                "The cleaned CSV is missing required columns: "
-                + ", ".join(sorted(missing))
+                "The cleaned CSV is missing required columns: " + ", ".join(sorted(missing))
             )
 
         for row_number, row in enumerate(reader, start=2):
@@ -100,9 +96,7 @@ def split_file(
             if sales_mode(transaction_id):
                 online_rows.append({**common, "sales_mode": "true"})
             else:
-                periodic_rows.append(
-                    (parsed_time, row_number, {**common, "sales_mode": "false"})
-                )
+                periodic_rows.append((parsed_time, row_number, {**common, "sales_mode": "false"}))
 
     # The original row number is a deterministic tie-breaker for equal times.
     periodic_rows.sort(key=lambda item: (item[0], item[1]))
@@ -121,10 +115,14 @@ def split_file(
         writer.writeheader()
         for index, (_, _, row) in enumerate(periodic_rows):
             # Group sizes differ by at most one row.
-            release_hour = min(
-                (index * GROUP_COUNT) // periodic_count,
-                GROUP_COUNT - 1,
-            ) if periodic_count else 0
+            release_hour = (
+                min(
+                    (index * GROUP_COUNT) // periodic_count,
+                    GROUP_COUNT - 1,
+                )
+                if periodic_count
+                else 0
+            )
             writer.writerow(
                 {
                     **row,

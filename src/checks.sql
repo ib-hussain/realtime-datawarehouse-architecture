@@ -32,6 +32,7 @@ LEFT JOIN data_warehouse.dim_time d ON d.time_key = f.time_key;
 
 -- Shed queue occupancy and recovery counts.
 SELECT COUNT(*) AS ever_shed,
+       COUNT(*) FILTER (WHERE in_progress AND NOT processed) AS in_progress,
        COUNT(*) FILTER (WHERE processed) AS marked_processed,
        COUNT(*) FILTER (WHERE NOT processed) AS still_waiting,
        MIN(shed_at) AS first_shed_at, MAX(processed_at) AS last_recovery_at

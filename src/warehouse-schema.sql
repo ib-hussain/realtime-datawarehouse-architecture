@@ -1,4 +1,3 @@
--- Active: 1794590548890@@127.0.0.1@5432@realtime_data_stream
 -- ============================================================================
 -- PROJECT: Near-Real-Time and Periodic Data Warehouse for a Retail Chain
 -- DBMS: PostgreSQL
@@ -135,6 +134,8 @@ CREATE TABLE waiting_area.shed_table_physical (
     sales_mode       BOOLEAN        NOT NULL DEFAULT FALSE,
     release_hour     SMALLINT       NOT NULL CHECK (release_hour BETWEEN 0 AND 47),
     shed_at          TIMESTAMPTZ    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    in_progress      BOOLEAN        NOT NULL DEFAULT FALSE,
+    claimed_at       TIMESTAMPTZ,
     processed        BOOLEAN        NOT NULL DEFAULT FALSE,
     processed_at     TIMESTAMPTZ,
 
@@ -142,7 +143,12 @@ CREATE TABLE waiting_area.shed_table_physical (
     CONSTRAINT shed_processing_time_is_valid CHECK (
         (processed = FALSE AND processed_at IS NULL)
         OR
-        (processed = TRUE AND processed_at IS NOT NULL)
+        (processed = TRUE AND in_progress = FALSE AND processed_at IS NOT NULL)
+    ),
+    CONSTRAINT shed_claim_is_valid CHECK (
+        (in_progress = FALSE AND claimed_at IS NULL)
+        OR
+        (in_progress = TRUE AND processed = FALSE AND claimed_at IS NOT NULL)
     ),
     CONSTRAINT fk_shed_periodic_row
         FOREIGN KEY (periodic_row_id)
@@ -193,6 +199,17 @@ INSERT INTO staging_area.store_list (store_id, store_name, city) VALUES
     (3, 'Manchester Arndale',  'Manchester'),
     (4, 'Birmingham Bullring', 'Birmingham'),
     (5, 'Edinburgh Princes',   'Edinburgh');
+
+-- Records the exact prepared files loaded into the operational/staging
+-- relations. Runtime startup uses this to reject a same-sized but different
+-- online CSV before source identities can be mixed.
+CREATE TABLE staging_area.load_manifest (
+    dataset_name VARCHAR(50) PRIMARY KEY,
+    source_path  TEXT        NOT NULL,
+    row_count    BIGINT      NOT NULL CHECK (row_count >= 0),
+    sha256       CHAR(64)    NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    loaded_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
 -- ============================================================================
 -- 6. STAR-SCHEMA DIMENSIONS
@@ -320,6 +337,10 @@ CREATE TABLE data_warehouse.products_store (
 CREATE TABLE data_warehouse.transactions (
     transaction_line_id BIGSERIAL      PRIMARY KEY,
     transaction_id      VARCHAR(20)    NOT NULL,
+    source_type          VARCHAR(8)     NOT NULL CHECK (
+        source_type IN ('online', 'periodic')
+    ),
+    source_row_id        BIGINT         NOT NULL CHECK (source_row_id > 0),
     customer_id         BIGINT         NOT NULL,
     product_id          VARCHAR(255)   NOT NULL,
     supplier_id         data_warehouse.supplier_id_enum NOT NULL,
@@ -338,6 +359,7 @@ CREATE TABLE data_warehouse.transactions (
     CONSTRAINT transaction_revenue_matches CHECK (
         revenue = quantity::NUMERIC * unit_price
     ),
+    CONSTRAINT uq_transactions_source UNIQUE (source_type, source_row_id),
     CONSTRAINT transaction_store_matches_sales_mode CHECK (
         (sales_mode = TRUE  AND store_id = 1)
         OR
@@ -372,6 +394,8 @@ CREATE TABLE data_warehouse.transactions (
 CREATE TABLE data_warehouse.live_cache (
     cache_id BIGSERIAL PRIMARY KEY,
     transaction_id VARCHAR(20) NOT NULL,
+    source_type VARCHAR(8) NOT NULL CHECK (source_type = 'online'),
+    source_row_id BIGINT NOT NULL CHECK (source_row_id > 0),
     customer_id BIGINT NOT NULL,
     product_id VARCHAR(255) NOT NULL,
     supplier_id data_warehouse.supplier_id_enum NOT NULL,
@@ -379,12 +403,39 @@ CREATE TABLE data_warehouse.live_cache (
     time_key BIGINT NOT NULL,
     product_store_key BIGINT NOT NULL,
     event_time TIMESTAMP NOT NULL,
-    quantity INTEGER NOT NULL,
-    unit_price NUMERIC(12,3) NOT NULL,
-    revenue NUMERIC(18,3) NOT NULL,
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    unit_price NUMERIC(12,3) NOT NULL CHECK (unit_price > 0),
+    revenue NUMERIC(18,3) NOT NULL CHECK (revenue > 0),
     sales_mode BOOLEAN NOT NULL DEFAULT TRUE CHECK (sales_mode),
     processing_mode data_warehouse.processing_mode_enum NOT NULL DEFAULT 'Immediate',
-    cached_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    cached_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_live_cache_source UNIQUE (source_type, source_row_id),
+    CONSTRAINT live_cache_revenue_matches CHECK (
+        revenue = quantity::NUMERIC * unit_price
+    ),
+    CONSTRAINT live_cache_rows_are_online CHECK (
+        sales_mode = TRUE AND store_id = 1 AND processing_mode = 'Immediate'
+    ),
+    CONSTRAINT fk_live_cache_customer
+        FOREIGN KEY (customer_id)
+        REFERENCES data_warehouse.dim_customer(customer_id),
+    CONSTRAINT fk_live_cache_product
+        FOREIGN KEY (product_id)
+        REFERENCES data_warehouse.dim_product(product_id),
+    CONSTRAINT fk_live_cache_supplier
+        FOREIGN KEY (supplier_id)
+        REFERENCES data_warehouse.dim_supplier(supplier_id),
+    CONSTRAINT fk_live_cache_store
+        FOREIGN KEY (store_id)
+        REFERENCES data_warehouse.dim_store(store_id),
+    CONSTRAINT fk_live_cache_time
+        FOREIGN KEY (time_key, event_time)
+        REFERENCES data_warehouse.dim_time(time_key, event_time),
+    CONSTRAINT fk_live_cache_product_store
+        FOREIGN KEY (product_store_key, product_id, store_id)
+        REFERENCES data_warehouse.products_store(
+            product_store_key, product_id, store_id
+        )
 );
 CREATE INDEX idx_live_cache_pending ON data_warehouse.live_cache(cache_id);
 
@@ -394,6 +445,8 @@ CREATE VIEW data_warehouse.fact_sales AS
 SELECT
     transaction_line_id AS fact_id,
     transaction_id,
+    source_type,
+    source_row_id,
     customer_id,
     product_id,
     supplier_id,
@@ -421,7 +474,7 @@ CREATE INDEX idx_periodic_release_queue
     ON oltp_physical.periodic_sales_data (released, release_hour, event_time);
 
 CREATE INDEX idx_shed_unprocessed
-    ON waiting_area.shed_table_physical (processed, shed_at)
+    ON waiting_area.shed_table_physical (processed, in_progress, shed_at)
     WHERE processed = FALSE;
 
 CREATE INDEX idx_customer_master_meshjoin

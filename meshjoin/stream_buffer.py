@@ -15,7 +15,7 @@ class Transaction:
     """One product line in a shopping cart, at the project fact-table grain."""
 
     source: str
-    source_row_id: int | None
+    source_row_id: int
     transaction_id: str
     event_time: datetime
     customer_id: int
@@ -123,4 +123,3 @@ class PriorityStreamBuffer:
         if transaction.source == "shed":
             return self.SHED_PRIORITY
         return self.PERIODIC_PRIORITY
-

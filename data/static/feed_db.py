@@ -20,13 +20,15 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import os
 import shutil
+import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from getpass import getpass
 from pathlib import Path
-from typing import Iterable, Sequence
 
 try:  # psycopg 3 is preferred.
     import psycopg  # type: ignore
@@ -150,11 +152,10 @@ def prepare_master_rows(
         missing = required.difference(reader.fieldnames)
         if missing:
             raise ValueError(
-                "The processed CSV is missing required columns: "
-                + ", ".join(sorted(missing))
+                "The processed CSV is missing required columns: " + ", ".join(sorted(missing))
             )
 
-        for row_number, row in enumerate(reader, start=2):
+        for row in reader:
             customer_id = integer_customer_id((row.get("CustomerID") or "").strip())
             product_id = (row.get("StockCode") or "").strip()
             country = (row.get("Country") or "").strip()
@@ -178,15 +179,9 @@ def prepare_master_rows(
                 "gender": GENDERS[stable(customer_text, 2)],
                 "age_group": AGE_GROUPS[stable(customer_text + "age", 7)],
                 "occupation": OCCUPATIONS[stable(customer_text + "occ", 10)],
-                "city_category": CITY_CATEGORIES[
-                    stable(customer_text + country, 3)
-                ],
-                "stay_in_current_city_years": STAY_VALUES[
-                    stable(customer_text + "stay", 5)
-                ],
-                "marital_status": MARITAL_STATUSES[
-                    stable(customer_text + "mar", 2)
-                ],
+                "city_category": CITY_CATEGORIES[stable(customer_text + country, 3)],
+                "stay_in_current_city_years": STAY_VALUES[stable(customer_text + "stay", 5)],
+                "marital_status": MARITAL_STATUSES[stable(customer_text + "mar", 2)],
             }
         )
 
@@ -197,9 +192,7 @@ def prepare_master_rows(
             {
                 "product_id": product_id,
                 "product_name": product_names.get(product_id) or "UNKNOWN",
-                "product_category": PRODUCT_CATEGORIES[
-                    stable(product_id + "cat", 10)
-                ],
+                "product_category": PRODUCT_CATEGORIES[stable(product_id + "cat", 10)],
                 "supplier_id": supplier_id,
                 "supplier_name": supplier_name,
             }
@@ -216,6 +209,16 @@ def write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[dict[str, st
         writer.writerows(rows)
 
 
+def file_sha256(path: Path) -> str:
+    """Return a streaming SHA-256 digest without loading the file into memory."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def write_project_csvs(
     processed_path: Path,
     online_path: Path,
@@ -225,15 +228,6 @@ def write_project_csvs(
 ) -> tuple[int, int]:
     """Write all CSV deliverables and return customer/product counts."""
 
-    online_columns = [
-        "transaction_id",
-        "customer_id",
-        "product_id",
-        "quantity",
-        "unit_price",
-        "event_time",
-        "sales_mode",
-    ]
     customer_columns = [
         "customer_id",
         "gender",
@@ -262,25 +256,76 @@ def write_project_csvs(
 
 
 def connect_database(config: DatabaseConfig):
+    parameters = {
+        "host": config.host,
+        "port": config.port,
+        "dbname": config.database,
+        "user": config.user,
+        "connect_timeout": 5,
+        "application_name": "dwbi_preparation",
+    }
+    if config.password:
+        parameters["password"] = config.password
     if psycopg is not None:
-        return psycopg.connect(
-            host=config.host,
-            port=config.port,
-            dbname=config.database,
-            user=config.user,
-            password=config.password,
-        )
+        return psycopg.connect(**parameters)
     if psycopg2 is not None:
-        return psycopg2.connect(
-            host=config.host,
-            port=config.port,
-            dbname=config.database,
-            user=config.user,
-            password=config.password,
-        )
-    raise RuntimeError(
-        "Install psycopg (recommended) or psycopg2 before loading PostgreSQL."
+        return psycopg2.connect(**parameters)
+    raise RuntimeError("Install psycopg (recommended) or psycopg2 before loading PostgreSQL.")
+
+
+def validate_preparation_schema(config: DatabaseConfig) -> None:
+    """Fail before reading large CSVs when the target schema is incomplete."""
+
+    required = (
+        "oltp_online.online_sales_stream",
+        "oltp_physical.periodic_sales_data",
+        "staging_area.customer_master",
+        "staging_area.product_master",
+        "staging_area.load_manifest",
+        "staging_area.store_list",
+        "waiting_area.shed_table_physical",
+        "data_warehouse.dim_customer",
+        "data_warehouse.dim_product",
+        "data_warehouse.dim_supplier",
+        "data_warehouse.dim_store",
+        "data_warehouse.dim_time",
+        "data_warehouse.products_store",
+        "data_warehouse.transactions",
+        "data_warehouse.live_cache",
     )
+    connection = connect_database(config)
+    try:
+        missing: list[str] = []
+        with connection.cursor() as cursor:
+            for relation in required:
+                cursor.execute("SELECT to_regclass(%s)", (relation,))
+                if cursor.fetchone()[0] is None:
+                    missing.append(relation)
+        if missing:
+            raise RuntimeError(
+                "The preparation schema is incomplete. Missing: "
+                + ", ".join(missing)
+                + ". Run `python cli_app.py init-db --yes` on the intended "
+                "project database first."
+            )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM data_warehouse.transactions),
+                    (SELECT COUNT(*) FROM data_warehouse.live_cache),
+                    (SELECT COUNT(*) FROM waiting_area.shed_table_physical)
+                """
+            )
+            fact_rows, cache_rows, shed_rows = (int(value) for value in cursor.fetchone())
+        if fact_rows or cache_rows or shed_rows:
+            raise RuntimeError(
+                "Refusing to replace source tables while warehouse runtime data exists "
+                f"(facts={fact_rows}, cache={cache_rows}, shed={shed_rows}). Use a backup, "
+                "then run `python cli_app.py init-db --yes` for an intentional clean replay."
+            )
+    finally:
+        connection.close()
 
 
 def chunks(rows: Sequence[tuple], size: int = INSERT_BATCH_SIZE):
@@ -302,6 +347,8 @@ def load_database(
     product_csv: Path,
 ) -> None:
     """Replace the preparation tables with the current deterministic data."""
+
+    validate_preparation_schema(config)
 
     online_rows: list[tuple] = []
     with online_csv.open("r", encoding="utf-8-sig", newline="") as source:
@@ -373,7 +420,8 @@ def load_database(
                 "oltp_online.online_sales_stream, "
                 "oltp_physical.periodic_sales_data, "
                 "staging_area.customer_master, "
-                "staging_area.product_master "
+                "staging_area.product_master, "
+                "staging_area.load_manifest "
                 "RESTART IDENTITY CASCADE"
             )
 
@@ -417,6 +465,41 @@ def load_database(
             """,
             product_rows,
         )
+        manifest_rows = (
+            (
+                "online_sales_stream",
+                str(online_csv.resolve()),
+                len(online_rows),
+                file_sha256(online_csv),
+            ),
+            (
+                "periodic_sales_data",
+                str(periodic_csv.resolve()),
+                len(periodic_rows),
+                file_sha256(periodic_csv),
+            ),
+            (
+                "customer_master",
+                str(customer_csv.resolve()),
+                len(customer_rows),
+                file_sha256(customer_csv),
+            ),
+            (
+                "product_master",
+                str(product_csv.resolve()),
+                len(product_rows),
+                file_sha256(product_csv),
+            ),
+        )
+        insert_batches(
+            connection,
+            """
+            INSERT INTO staging_area.load_manifest
+                (dataset_name, source_path, row_count, sha256)
+            VALUES (%s, %s, %s, %s)
+            """,
+            manifest_rows,
+        )
         connection.commit()
     except Exception:
         connection.rollback()
@@ -430,20 +513,30 @@ def load_database(
     print(f"Loaded product master rows: {len(product_rows)}")
 
 
-def prompt_or(value: str | None, message: str, default: str | None = None) -> str:
-    if value is not None:
-        return value
-    suffix = f" [{default}]" if default is not None else ""
-    answer = input(f"{message}{suffix}: ").strip()
-    return answer or (default or "")
+def environment_defaults() -> dict[str, str]:
+    """Read root .env values while preserving process-environment overrides."""
+
+    values = dict(os.environ)
+    env_path = project_root() / ".env"
+    if env_path.is_file():
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    return values
 
 
 def database_config_from_args(args: argparse.Namespace) -> DatabaseConfig:
-    host = prompt_or(args.host, "PostgreSQL host", "localhost")
-    port = int(prompt_or(args.port, "PostgreSQL port", "5432"))
-    database = prompt_or(args.database, "Database name")
-    user = prompt_or(args.user, "Database user")
-    password = args.password if args.password is not None else getpass("Database password: ")
+    values = environment_defaults()
+    host = args.host or values.get("PGHOST", "localhost")
+    port = args.port or int(values.get("PGPORT", "5432"))
+    database = args.database or values.get("PGDATABASE", "realtime_data_stream")
+    user = args.user or values.get("PGUSER", "postgres")
+    password = args.password if args.password is not None else values.get("PGPASSWORD", "")
+    if not password and sys.stdin.isatty():
+        password = getpass("Database password (blank for peer/trust auth): ")
     return DatabaseConfig(host, port, database, user, password)
 
 
@@ -452,11 +545,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=root / "data" / "raw" / "online-retail.csv")
     parser.add_argument("--host")
-    parser.add_argument("--port")
+    parser.add_argument("--port", type=int)
     parser.add_argument("--database")
     parser.add_argument("--user")
     parser.add_argument("--password")
-    parser.add_argument("--skip-db", action="store_true", help="Only create CSVs; do not connect to PostgreSQL.")
+    parser.add_argument(
+        "--skip-db", action="store_true", help="Only create CSVs; do not connect to PostgreSQL."
+    )
     return parser.parse_args()
 
 
@@ -499,4 +594,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

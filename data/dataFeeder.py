@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import queue
+import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -121,30 +122,35 @@ class FeedStopped(RuntimeError):
 
 
 def connect_database(config: DatabaseConfig):
+    parameters = {
+        "host": config.host,
+        "port": config.port,
+        "dbname": config.database,
+        "user": config.user,
+        "connect_timeout": 5,
+        "application_name": "dwbi_v1_feeder",
+    }
+    if config.password:
+        parameters["password"] = config.password
     if psycopg is not None:
-        return psycopg.connect(
-            host=config.host,
-            port=config.port,
-            dbname=config.database,
-            user=config.user,
-            password=config.password,
-        )
+        return psycopg.connect(**parameters)
     if psycopg2 is not None:
-        return psycopg2.connect(
-            host=config.host,
-            port=config.port,
-            dbname=config.database,
-            user=config.user,
-            password=config.password,
-        )
-    raise RuntimeError(
-        "Install psycopg (recommended) or psycopg2 before reading PostgreSQL."
-    )
+        return psycopg2.connect(**parameters)
+    raise RuntimeError("Install psycopg (recommended) or psycopg2 before reading PostgreSQL.")
 
 
 def _as_record(source: str, row: tuple[Any, ...]) -> SaleRecord:
     if source == "online":
-        row_id, transaction_id, event_time, customer_id, product_id, quantity, unit_price, sales_mode = row
+        (
+            row_id,
+            transaction_id,
+            event_time,
+            customer_id,
+            product_id,
+            quantity,
+            unit_price,
+            sales_mode,
+        ) = row
         return SaleRecord(
             source="online",
             source_row_id=int(row_id),
@@ -367,24 +373,26 @@ def parallel_feed(
     }
 
 
-def prompt_or(value: str | None, message: str, default: str | None = None) -> str:
-    if value is not None:
-        return value
-    suffix = f" [{default}]" if default is not None else ""
-    answer = input(f"{message}{suffix}: ").strip()
-    return answer or (default or "")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host")
-    parser.add_argument("--port")
+    parser.add_argument("--port", type=int)
     parser.add_argument("--database")
     parser.add_argument("--user")
     parser.add_argument("--password")
     parser.add_argument("--buffer-size", type=int, default=DEFAULT_BUFFER_SIZE)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--periodic-release-hour", type=int, choices=range(48))
+    parser.add_argument(
+        "--dynamic-source",
+        type=Path,
+        help="Optionally prepare and load a selected UCI-format CSV first.",
+    )
+    parser.add_argument(
+        "--dynamic-output-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent / "dynamic",
+    )
     parser.add_argument(
         "--demo-drain",
         action="store_true",
@@ -395,24 +403,34 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    from data.static.feed_db import environment_defaults
+
+    defaults = environment_defaults()
+    password = args.password if args.password is not None else defaults.get("PGPASSWORD", "")
+    if not password and sys.stdin.isatty():
+        password = getpass("Database password (blank for peer/trust auth): ")
     config = DatabaseConfig(
-        host=prompt_or(args.host, "PostgreSQL host", "localhost"),
-        port=int(prompt_or(args.port, "PostgreSQL port", "5432")),
-        database=prompt_or(args.database, "Database name"),
-        user=prompt_or(args.user, "Database user"),
-        password=args.password if args.password is not None else getpass("Database password: "),
+        host=args.host or defaults.get("PGHOST", "localhost"),
+        port=args.port or int(defaults.get("PGPORT", "5432")),
+        database=args.database or defaults.get("PGDATABASE", "realtime_data_stream"),
+        user=args.user or defaults.get("PGUSER", "postgres"),
+        password=password,
     )
     if args.dynamic_source:
         from data.dynamic.feed_db import run as dynamic_prepare
+
         if args.dynamic_output_dir.resolve() == args.dynamic_source.resolve():
-            raise ValueError('Dynamic input and output directory must differ')
+            raise ValueError("Dynamic input and output directory must differ")
         # This operation replaces the input tables. Never run it concurrently
         # with the warehouse enrichment process.
         from observatory import is_running
+
         if is_running():
-            raise RuntimeError('Stop the MESHJOIN runtime before preparing dynamic sources')
+            raise RuntimeError("Stop the MESHJOIN runtime before preparing dynamic sources")
         result = dynamic_prepare(args.dynamic_source, args.dynamic_output_dir, config)
-        print('Dynamic feed prepared:', result)
+        print("Dynamic feed prepared:", result)
+        if not args.demo_drain:
+            return
     buffer = StreamBuffer(args.buffer_size)
     stop_event = threading.Event()
 
@@ -447,4 +465,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
