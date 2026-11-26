@@ -33,6 +33,25 @@ class RuntimeTelemetryTests(unittest.TestCase):
         self.assertEqual(payload["stream_buffer_limit"], 1_000)
         self.assertFalse(any(payload["threads"].values()))
 
+    def test_telemetry_write_survives_windows_replace_lock(self):
+        runtime = RuntimeConfig(
+            database=DatabaseConfig("localhost", 5432, "dwbi", "postgres", ""),
+            online_file=Path("online.csv"),
+        )
+        with patch("data_enrichment.load_runtime_config", return_value=runtime):
+            application = DataEnrichmentApplication("peak")
+
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry_file = Path(directory) / "telemetry.json"
+            application.telemetry_file = telemetry_file
+            with patch.object(Path, "replace", side_effect=PermissionError("file is locked")):
+                application._write_telemetry()
+
+            payload = json.loads(telemetry_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["arrival_mode"], "peak")
+        self.assertIsNone(application.telemetry()["telemetry_write_error"])
+
 
 if __name__ == "__main__":
     unittest.main()

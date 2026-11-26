@@ -158,7 +158,15 @@ class WarehouseLoader:
         if not self._facts and not self._online_cache:
             return
         columns = "(transaction_id, source_type, source_row_id, customer_id, product_id, supplier_id, store_id, time_key, product_store_key, event_time, quantity, unit_price, revenue, sales_mode, processing_mode)"
-        values = "(" + ", ".join(["%s"] * 15) + ")"
+        # PostgreSQL does not infer enum types for parameters inside a
+        # VALUES-derived relation.  Cast the two enum fields at the parameter
+        # boundary so both direct fact inserts and the live-cache SELECT have
+        # the same behavior on PostgreSQL/psycopg versions.
+        values = (
+            "(%s, %s, %s, %s, %s, "
+            "%s::data_warehouse.supplier_id_enum, %s, %s, %s, %s, %s, %s, %s, %s, "
+            "%s::data_warehouse.processing_mode_enum)"
+        )
         facts_inserted = 0
         cache_inserted = 0
         try:

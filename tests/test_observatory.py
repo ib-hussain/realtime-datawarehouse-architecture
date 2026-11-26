@@ -53,6 +53,31 @@ class ObservatoryTests(unittest.TestCase):
                 self.assertFalse(observatory.is_running())
             self.assertFalse(pid_path.exists())
 
+    def test_windows_running_pid_uses_native_process_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "runtime.json"
+            pid_path.write_text(json.dumps({"pid": 12345}), encoding="utf-8")
+            with (
+                patch.object(observatory, "PID_PATH", pid_path),
+                patch.object(observatory.os, "name", "nt"),
+                patch.object(observatory, "_windows_pid_is_alive", return_value=True) as check,
+            ):
+                self.assertTrue(observatory.is_running())
+            check.assert_called_once_with(12345)
+            self.assertTrue(pid_path.exists())
+
+    def test_windows_stale_pid_file_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "runtime.json"
+            pid_path.write_text(json.dumps({"pid": 12345}), encoding="utf-8")
+            with (
+                patch.object(observatory, "PID_PATH", pid_path),
+                patch.object(observatory.os, "name", "nt"),
+                patch.object(observatory, "_windows_pid_is_alive", return_value=False),
+            ):
+                self.assertFalse(observatory.is_running())
+            self.assertFalse(pid_path.exists())
+
     def test_tail_validates_line_count(self):
         with self.assertRaises(ValueError):
             observatory.tail(0)

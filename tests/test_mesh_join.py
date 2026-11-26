@@ -64,6 +64,37 @@ class LockConnection:
         self.closed = True
 
 
+class FlushCursor:
+    def __init__(self):
+        self.statements = []
+        self.rowcount = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def executemany(self, sql, parameters):
+        self.statements.append(sql)
+        self.rowcount = len(parameters)
+
+
+class FlushConnection:
+    def __init__(self):
+        self.cursor_instance = FlushCursor()
+        self.committed = False
+
+    def cursor(self):
+        return self.cursor_instance
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        raise AssertionError("flush should not roll back in this test")
+
+
 class WarehouseLoaderTests(unittest.TestCase):
     def test_periodic_stage_retains_idempotency_identity(self):
         transaction = Transaction(
@@ -120,6 +151,40 @@ class WarehouseLoaderTests(unittest.TestCase):
         self.assertTrue(state.stop_event.is_set())
         self.assertTrue(connection.committed)
         self.assertTrue(connection.closed)
+
+    def test_cache_insert_casts_postgresql_enum_parameters(self):
+        connection = FlushConnection()
+        with patch("meshjoin.mesh_join.connect_database", return_value=connection):
+            loader = WarehouseLoader(
+                database=None,
+                stores={1: ("Online", "Online")},
+                flush_size=100,
+            )
+            loader._online_cache.append(
+                (
+                    "INV-1",
+                    "online",
+                    1,
+                    12345,
+                    "PRODUCT-1",
+                    "SUP01",
+                    1,
+                    11,
+                    22,
+                    datetime(2011, 1, 2, 3, 4),
+                    2,
+                    Decimal("3.50"),
+                    Decimal("7.00"),
+                    True,
+                    "Immediate",
+                )
+            )
+            loader.flush()
+
+        sql = connection.cursor_instance.statements[0]
+        self.assertIn("::data_warehouse.supplier_id_enum", sql)
+        self.assertIn("::data_warehouse.processing_mode_enum", sql)
+        self.assertTrue(connection.committed)
 
 
 if __name__ == "__main__":

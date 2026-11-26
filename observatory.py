@@ -155,13 +155,40 @@ def _read_pid_record() -> dict | None:
         return None
 
 
+def _windows_pid_is_alive(pid: int) -> bool:
+    """Check a process handle on Windows; ``os.kill(pid, 0)`` is unreliable there."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    open_process.restype = wintypes.HANDLE
+    handle = open_process(0x00100000 | 0x1000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED_INFO
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def is_running() -> bool:
     payload = _read_pid_record()
     if payload is None:
         return False
     pid = payload["pid"]
     try:
-        os.kill(pid, 0)
+        if os.name == "nt":
+            if not _windows_pid_is_alive(pid):
+                PID_PATH.unlink(missing_ok=True)
+                return False
+        else:
+            os.kill(pid, 0)
         process_command = Path(f"/proc/{pid}/cmdline")
         if process_command.exists() and b"data_enrichment" not in process_command.read_bytes():
             PID_PATH.unlink(missing_ok=True)

@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import json
 import threading
+import time
+import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,6 +40,7 @@ class DataEnrichmentApplication:
         self.mesh_worker: MeshJoinWorker | None = None
         self.mesh_thread: threading.Thread | None = None
         self.telemetry_file: Path | None = None
+        self._telemetry_write_error: str | None = None
 
     def start(self) -> None:
         if not self.runtime.online_file.is_file():
@@ -171,6 +174,7 @@ class DataEnrichmentApplication:
                 "PeriodicThread": bool(self.periodic and self.periodic.is_alive()),
                 "MeshJoinThread": bool(self.mesh_thread and self.mesh_thread.is_alive()),
             },
+            "telemetry_write_error": self._telemetry_write_error,
             "errors": errors,
         }
 
@@ -178,9 +182,38 @@ class DataEnrichmentApplication:
         if self.telemetry_file is None:
             return
         self.telemetry_file.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.telemetry_file.with_name(self.telemetry_file.name + ".tmp")
-        temporary.write_text(json.dumps(self.telemetry(), indent=2), encoding="utf-8")
-        temporary.replace(self.telemetry_file)
+        payload = json.dumps(self.telemetry(), indent=2)
+        temporary = self.telemetry_file.with_name(
+            f".{self.telemetry_file.name}.{uuid.uuid4().hex}.tmp"
+        )
+        last_error: OSError | None = None
+        try:
+            temporary.write_text(payload, encoding="utf-8")
+            for attempt in range(6):
+                try:
+                    temporary.replace(self.telemetry_file)
+                    self._telemetry_write_error = None
+                    return
+                except PermissionError as error:
+                    last_error = error
+                    if attempt < 5:
+                        time.sleep(0.05 * (attempt + 1))
+
+            # Windows readers can briefly hold the destination open.  A
+            # direct write is a safe fallback for this small observability
+            # snapshot and, importantly, must not terminate the worker.
+            try:
+                self.telemetry_file.write_text(payload, encoding="utf-8")
+                self._telemetry_write_error = None
+                return
+            except OSError as error:
+                last_error = error
+        except OSError as error:
+            last_error = error
+        finally:
+            temporary.unlink(missing_ok=True)
+
+        self._telemetry_write_error = str(last_error) if last_error else "unknown telemetry write error"
 
     def run_without_console(self, telemetry_file: Path | None = None) -> None:
         """Keep threads alive for an external controller or test harness."""
